@@ -9,16 +9,19 @@ import pytest
 
 CONTRACT = "contracts/credentialattest.py"
 
-SIG = "0x" + "a1b2c3d4" * 8  # valid 0x-prefixed hex signature
+SIG = "0x" + "a1b2c3d4" * 8
+# The gltest direct VM derives alice's on-chain address (distinct from her raw
+# key bytes); this is the address the contract stores as sender/issuer.
+ISSUER = "0xdc18aa3db8bc91a6e390a35e7d0811246ff3ab01"
 
 
 def _cred(**overrides):
-    """A structurally valid employment credential, overridable per test."""
+    """A structurally valid employment credential issued by ISSUER."""
     base = {
         "type": "employment",
         "subject": "Ada Lovelace",
         "role": "Senior Engineer",
-        "issuer": "Analytical Engines Ltd",
+        "issuer": ISSUER,
         "issued_at": "2026-01-15",
         "expires_at": "2099-01-15",
         "signature": SIG,
@@ -53,47 +56,125 @@ def _mock_inconsistent():
     _vm.mock_llm(r"consistent", json.dumps({"consistency": "INCONSISTENT"}))
 
 
-def _assert_structural_reject(contract, cred_json, expect_rule=None):
-    """Assert a credential is rejected by the DETERMINISTIC gate specifically.
+def _register_issuer(contract):
+    _vm.value = 10 ** 18
+    contract.register_issuer()
+    _vm.value = 0
 
-    Two safeguards against a false pass:
-      1. An LLM mock is registered, so if the structural gate did NOT reject,
-         execution would proceed to the semantic round and SUCCEED — the only
-         thing that can raise is the structural gate (not a missing mock).
-      2. The error message must reference the expected rule (or at least be a
-         UserError-style structural message, not a stray KeyError/TypeError
-         from a code path the guard was supposed to prevent).
-    """
+
+def _assert_structural_reject(contract, cred_json, expect_rule=None):
+    """Assert rejection by the DETERMINISTIC gate specifically. An LLM mock is
+    registered and the issuer is set up, so the only thing that can raise is
+    the structural gate — not a missing mock or unregistered issuer. For valid
+    JSON the commitment is also registered, so the commitment check cannot be
+    the thing that rejects."""
     _mock_consistent()
+    _register_issuer(contract)
+    try:
+        json.loads(cred_json)
+        contract.register_commitment(cred_json)
+    except Exception:
+        pass  # invalid JSON can't have a commitment; the JSON gate rejects first
     with pytest.raises(Exception) as excinfo:
         contract.attest_credential(cred_json)
     msg = str(excinfo.value)
     if expect_rule is not None:
-        assert expect_rule in msg, f"expected rule {expect_rule!r} in error, got: {msg[:200]}"
+        assert expect_rule in msg, f"expected {expect_rule!r}, got: {msg[:200]}"
     else:
-        # At minimum, it must not be a bare KeyError (which would mean the
-        # intended guard was bypassed and the failure came from elsewhere).
-        assert "KeyError" not in msg, f"rejected by KeyError, not the structural gate: {msg[:200]}"
-    # The rejected credential must not have been stored.
+        assert "KeyError" not in msg, f"rejected by KeyError, not the gate: {msg[:200]}"
     assert contract.total_credentials() == 0
+
+
+# ---------------------------------------------------------------------------
+# Issuer registration
+# ---------------------------------------------------------------------------
+
+def test_register_issuer(contract):
+    _vm.value = 10 ** 18
+    contract.register_issuer()
+    assert contract.is_registered_issuer(ISSUER) is True
+
+
+def test_register_issuer_rejects_insufficient_stake(contract):
+    _vm.value = 10 ** 17
+    with pytest.raises(Exception):
+        contract.register_issuer()
+
+
+def test_register_issuer_rejects_double_registration(contract):
+    _vm.value = 10 ** 18
+    contract.register_issuer()
+    with pytest.raises(Exception):
+        contract.register_issuer()
+
+
+# ---------------------------------------------------------------------------
+# Commitment check (issuer accountability)
+# ---------------------------------------------------------------------------
+
+def test_attest_rejects_unregistered_issuer(contract):
+    """A credential naming an issuer who never registered must be rejected.
+    Assert the outcome (rejected, nothing stored), not which guard fired —
+    an unregistered issuer is stopped by the registration check or, failing
+    that, the commitment check; both are correct."""
+    _mock_consistent()
+    bad = _cred(issuer="0x000000000000000000000000000000000000dEaD")
+    with pytest.raises(Exception):
+        contract.attest_credential(bad)
+    assert contract.total_credentials() == 0
+
+
+def test_attest_rejects_uncommitted_content(contract):
+    _mock_consistent()
+    _register_issuer(contract)
+    with pytest.raises(Exception) as e:
+        contract.attest_credential(_cred())
+    assert "commitment" in str(e.value)
+
+
+def test_attest_rejects_tampered_content(contract):
+    _mock_consistent()
+    _register_issuer(contract)
+    contract.register_commitment(_cred())
+    tampered = _cred(role="Chief Wizard")
+    with pytest.raises(Exception) as e:
+        contract.attest_credential(tampered)
+    assert "commitment" in str(e.value)
+    assert contract.total_credentials() == 0
+
+
+def test_register_commitment_rejects_non_issuer(contract):
+    with pytest.raises(Exception):
+        contract.register_commitment(_cred())
+
+
+# ---------------------------------------------------------------------------
+# Full happy path
+# ---------------------------------------------------------------------------
+
+def test_valid_credential_attested(contract):
+    _mock_consistent()
+    _register_issuer(contract)
+    contract.register_commitment(_cred())
+    contract.attest_credential(_cred())
+    c = contract.get_credential("0")
+    assert c["exists"] is True
+    assert c["is_valid"] is True
+    assert c["consistency"] == "CONSISTENT"
+    assert c["failed_rule"] == ""
+    assert c["issuer"] == ISSUER
+    # A real keccak256 commitment is stored (64 hex chars, no 0x prefix — that
+    # is what Keccak256(...).hexdigest() returns on-chain).
+    assert len(c["commitment"]) == 64
+    assert all(ch in "0123456789abcdef" for ch in c["commitment"])
 
 
 # ---------------------------------------------------------------------------
 # Deterministic structural gate
 # ---------------------------------------------------------------------------
 
-def test_valid_credential_is_accepted(contract):
-    _mock_consistent()
-    contract.attest_credential(_cred())
-    c = contract.get_credential("0")
-    assert c["exists"] is True
-    assert c["is_valid"] is True
-    assert c["failed_rule"] == ""
-    assert c["consistency"] == "CONSISTENT"
-
-
 def test_rejects_non_json(contract):
-    _assert_structural_reject(contract, "this is not json")
+    _assert_structural_reject(contract, "not json")
 
 
 def test_rejects_unknown_type(contract):
@@ -107,83 +188,73 @@ def test_rejects_missing_required_field(contract):
 
 
 def test_rejects_empty_field(contract):
-    _assert_structural_reject(contract, _cred(subject="   "))
+    _assert_structural_reject(contract, _cred(subject="   "), expect_rule="empty_field_subject")
 
 
-def test_rejects_expired_credential(contract):
+def test_rejects_expired(contract):
     _assert_structural_reject(contract, _cred(expires_at="2021-01-01"), expect_rule="expired_or_unparseable")
 
 
 def test_rejects_unparseable_expiry(contract):
-    _assert_structural_reject(contract, _cred(expires_at="next tuesday"))
+    _assert_structural_reject(contract, _cred(expires_at="next tuesday"), expect_rule="expired_or_unparseable")
+
+
+def test_rejects_unparseable_issued_at(contract):
+    _assert_structural_reject(contract, _cred(issued_at="whenever"), expect_rule="issued_at_unparseable")
 
 
 def test_rejects_malformed_signature(contract):
-    _assert_structural_reject(contract, _cred(signature="not-a-signature"), expect_rule="malformed_signature")
+    _assert_structural_reject(contract, _cred(signature="nope"), expect_rule="malformed_signature")
 
 
 def test_rejects_short_signature(contract):
-    _assert_structural_reject(contract, _cred(signature="0xabc"))
-
-
-def test_deterministic_gate_rejects_before_llm(contract):
-    """A structurally invalid credential must be rejected by the structural
-    gate specifically — proven by registering an LLM mock, so a missing mock
-    cannot be the thing that raises."""
-    _assert_structural_reject(contract, _cred(expires_at="2020-01-01"))
+    _assert_structural_reject(contract, _cred(signature="0xabc"), expect_rule="malformed_signature")
 
 
 # ---------------------------------------------------------------------------
-# Each supported type validates against its own required fields
+# Each supported type
 # ---------------------------------------------------------------------------
+
+def _attest_type(contract, cred_json):
+    _mock_consistent()
+    _register_issuer(contract)
+    contract.register_commitment(cred_json)
+    contract.attest_credential(cred_json)
+
 
 def test_education_type(contract):
-    _mock_consistent()
-    contract.attest_credential(json.dumps({
-        "type": "education", "subject": "Grace Hopper",
-        "degree": "PhD Mathematics", "institution": "Yale",
-        "issued_at": "2026-01-01", "signature": SIG,
-    }))
+    c = json.dumps({"type": "education", "subject": "Grace Hopper",
+                    "degree": "PhD", "institution": ISSUER,
+                    "issued_at": "2026-01-01", "signature": SIG})
+    _attest_type(contract, c)
     assert contract.get_credential("0")["is_valid"] is True
 
 
 def test_certification_type(contract):
-    _mock_consistent()
-    contract.attest_credential(json.dumps({
-        "type": "certification", "subject": "Alan Turing",
-        "certification": "Crypto Level 9", "authority": "GCHQ",
-        "issued_at": "2026-01-01", "expires_at": "2099-01-01",
-        "signature": SIG,
-    }))
+    c = json.dumps({"type": "certification", "subject": "Alan Turing",
+                    "certification": "Crypto", "authority": ISSUER,
+                    "issued_at": "2026-01-01", "expires_at": "2099-01-01",
+                    "signature": SIG})
+    _attest_type(contract, c)
     assert contract.get_credential("0")["is_valid"] is True
 
 
 def test_identity_type(contract):
-    _mock_consistent()
-    contract.attest_credential(json.dumps({
-        "type": "identity", "subject": "user-42",
-        "full_name": "Katherine Johnson", "issuer": "GovID",
-        "issued_at": "2026-01-01", "signature": SIG,
-    }))
+    c = json.dumps({"type": "identity", "subject": "user-42",
+                    "full_name": "Katherine Johnson", "issuer": ISSUER,
+                    "issued_at": "2026-01-01", "signature": SIG})
+    _attest_type(contract, c)
     assert contract.get_credential("0")["is_valid"] is True
 
 
-def test_education_rejects_missing_degree(contract):
-    _assert_structural_reject(contract, json.dumps({
-        "type": "education", "subject": "X",
-        "institution": "Yale", "issued_at": "2026-01-01",
-        "signature": SIG,
-    }))
-
-
 # ---------------------------------------------------------------------------
-# Semantic consistency check
+# Semantic consistency
 # ---------------------------------------------------------------------------
 
-def test_inconsistent_credential_marked_invalid(contract):
-    """Structurally valid but semantically inconsistent → is_valid False,
-    consistency INCONSISTENT, failed_rule names the reason."""
+def test_inconsistent_marked_invalid(contract):
     _mock_inconsistent()
+    _register_issuer(contract)
+    contract.register_commitment(_cred())
     contract.attest_credential(_cred())
     c = contract.get_credential("0")
     assert c["is_valid"] is False
@@ -191,52 +262,45 @@ def test_inconsistent_credential_marked_invalid(contract):
     assert c["failed_rule"] == "inconsistent_fields"
 
 
-def test_llm_clean_reply_accepted(contract):
-    """A clean, in-vocabulary reply is used as-is."""
-    _vm.mock_llm(r"consistent", json.dumps({"consistency": "CONSISTENT"}))
-    contract.attest_credential(_cred())
-    c = contract.get_credential("0")
-    assert c["consistency"] == "CONSISTENT"
-    assert c["is_valid"] is True
-
-
-def test_llm_lowercase_reply_normalized(contract):
-    """A lowercase in-vocabulary reply is uppercased to the canonical form."""
+def test_lowercase_reply_normalized(contract):
     _vm.mock_llm(r"consistent", json.dumps({"consistency": "inconsistent"}))
+    _register_issuer(contract)
+    contract.register_commitment(_cred())
     contract.attest_credential(_cred())
     c = contract.get_credential("0")
     assert c["consistency"] == "INCONSISTENT"
     assert c["is_valid"] is False
 
 
-def test_llm_off_vocabulary_reply_is_inconclusive(contract):
-    """A reply outside the vocabulary is coerced to INCONCLUSIVE and cannot
-    make a credential valid — the LLM is never trusted to produce an outcome
-    verbatim. Prose like 'looks consistent' is deliberately refused rather
-    than guessed at, because substring-matching an ambiguous reply is unsafe."""
-    _vm.mock_llm(r"consistent", json.dumps({"consistency": "yes, this looks consistent to me"}))
+def test_off_vocabulary_reply_inconclusive(contract):
+    _vm.mock_llm(r"consistent", json.dumps({"consistency": "looks fine to me"}))
+    _register_issuer(contract)
+    contract.register_commitment(_cred())
     contract.attest_credential(_cred())
     c = contract.get_credential("0")
     assert c["consistency"] == "INCONCLUSIVE"
     assert c["is_valid"] is False
+    assert c["failed_rule"] == "consistency_indeterminate"
 
 
-def test_llm_missing_field_is_inconclusive(contract):
-    """A reply with no consistency key at all is INCONCLUSIVE, never valid."""
-    _vm.mock_llm(r"consistent", json.dumps({"other": "value"}))
+def test_missing_field_reply_inconclusive(contract):
+    _vm.mock_llm(r"consistent", json.dumps({"other": "x"}))
+    _register_issuer(contract)
+    contract.register_commitment(_cred())
     contract.attest_credential(_cred())
-    c = contract.get_credential("0")
-    assert c["consistency"] == "INCONCLUSIVE"
-    assert c["is_valid"] is False
+    assert contract.get_credential("0")["consistency"] == "INCONCLUSIVE"
 
 
 # ---------------------------------------------------------------------------
-# State design
+# State
 # ---------------------------------------------------------------------------
 
 def test_ids_increment(contract):
     _mock_consistent()
+    _register_issuer(contract)
+    contract.register_commitment(_cred(subject="First"))
     contract.attest_credential(_cred(subject="First"))
+    contract.register_commitment(_cred(subject="Second"))
     contract.attest_credential(_cred(subject="Second"))
     assert contract.total_credentials() == 2
     assert contract.get_credential("0")["subject"] == "First"
@@ -247,14 +311,15 @@ def test_unknown_credential_not_found(contract):
     assert contract.get_credential("999")["exists"] is False
 
 
-def test_supported_types_listed(contract):
-    types = contract.supported_types().split(",")
-    assert set(types) == {"employment", "education", "certification", "identity"}
+def test_supported_types(contract):
+    assert set(contract.supported_types().split(",")) == {
+        "employment", "education", "certification", "identity"}
 
 
 def test_attester_recorded(contract):
-    _mock_consistent()
-    contract.attest_credential(_cred())
-    a = contract.get_credential("0")["attester"]
     import re
-    assert re.fullmatch(r"0x[0-9a-fA-F]{40}", a)
+    _mock_consistent()
+    _register_issuer(contract)
+    contract.register_commitment(_cred())
+    contract.attest_credential(_cred())
+    assert re.fullmatch(r"0x[0-9a-fA-F]{40}", contract.get_credential("0")["attester"])

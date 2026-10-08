@@ -1,22 +1,12 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 
-"""CredentialAttest — schema-validated, consensus-verified credential attestation.
+"""CredentialAttest — issuer-committed, consensus-verified credential attestation.
 
-Attests that a structured credential is well-formed AND that its fields
-actually cohere. Two independent checks produce the stored verdict.
-
-Deterministic (every validator computes identically): JSON parses, required
-fields present and non-empty for the declared type, expiry parseable and in
-the future, signature is well-formed hex. Most malformed credentials die
-here, cheaply and unambiguously.
-
-Equivalence (gl.eq_principle.prompt_comparative): validators judge whether the
-credential's free-text fields are internally consistent. Bounded strictly to
-the submitted document — no network dependency.
-
-Validators compare the FINAL VERDICT, not their reasoning. The deterministic
-gate runs first and can reject before any semantic check, so no LLM alone
-decides an outcome.
+Well-formed + internally consistent + issued by a party who registered a
+keccak256 commitment to its content. (1) deterministic structural gate rejects
+before any LLM; (2) issuer keccak256 commitment, registered and staked (binds
+issuer to content without on-chain ECDSA recovery, which GenVM lacks);
+(3) field-coherence consensus (prompt_comparative), document only.
 """
 
 import json
@@ -26,7 +16,6 @@ from dataclasses import dataclass
 
 from genlayer import *
 
-# Required fields per credential type. An unknown type fails immediately.
 REQUIRED_FIELDS = {
     "employment": ["subject", "role", "issuer", "issued_at", "expires_at", "signature"],
     "education": ["subject", "degree", "institution", "issued_at", "signature"],
@@ -34,10 +23,15 @@ REQUIRED_FIELDS = {
     "identity": ["subject", "full_name", "issuer", "issued_at", "signature"],
 }
 
+ISSUER_STAKE = u256(1) * u256(10) ** u256(18)
 
-# ---------------------------------------------------------------------------
-# Storage model
-# ---------------------------------------------------------------------------
+
+@allow_storage
+@dataclass
+class Issuer:
+    address: str
+    stake: u256
+    active: bool
 
 
 @allow_storage
@@ -47,52 +41,44 @@ class Credential:
     cred_type: str
     subject: str
     issuer: str
+    commitment: str
     is_valid: bool
     failed_rule: str
     consistency: str
     attester: str
-    created_at: u256
-    verify_count: u256
-    last_verify_result: str
-
-
-# ---------------------------------------------------------------------------
-# Deterministic validation
-# ---------------------------------------------------------------------------
 
 
 def _is_hex_signature(value) -> bool:
-    """0x-prefixed hex of plausible length."""
-    if not isinstance(value, str):
-        return False
-    if not value.startswith("0x"):
-        return False
-    body = value[2:]
-    if len(body) < 32:
-        return False
-    return all(c in "0123456789abcdefABCDEF" for c in body)
+    return isinstance(value, str) and re.fullmatch(r"0x[0-9a-fA-F]{64,}", value) is not None
 
 
-def _is_future_iso8601(value) -> bool:
-    """Parseable ISO-8601 and in the future."""
+def _parse_iso(value):
     if not isinstance(value, str):
-        return False
+        return None
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        p = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except Exception:
-        return False
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed > datetime.now(timezone.utc)
+        return None
+    return p if p.tzinfo else p.replace(tzinfo=timezone.utc)
 
 
 def _is_nonempty_str(value) -> bool:
     return isinstance(value, str) and len(value.strip()) > 0
 
 
+def _canonical_content(cred: dict) -> str:
+    """Canonical JSON of substantive fields (no signature), sort_keys."""
+    content = {k: v for k, v in cred.items() if k != "signature"}
+    return json.dumps(content, sort_keys=True, separators=(",", ":"))
+
+
+def _content_commitment(cred: dict) -> str:
+    return Keccak256(_canonical_content(cred).encode("utf-8")).hexdigest()
+
+
 def _deterministic_check(cred: dict) -> dict:
-    """Structural validation. Every validator computes the same verdict.
-    Returns {"valid": bool, "failed_rule": str}; rule order is fixed."""
+    """Structural validation; identical every validator. Returns
+    {"valid": bool, "failed_rule": str}."""
     if not isinstance(cred, dict):
         return {"valid": False, "failed_rule": "not_a_json_object"}
 
@@ -108,7 +94,11 @@ def _deterministic_check(cred: dict) -> dict:
         if not _is_nonempty_str(cred[field]):
             return {"valid": False, "failed_rule": "empty_field_" + field}
 
-    if "expires_at" in cred and not _is_future_iso8601(cred["expires_at"]):
+    if _parse_iso(cred.get("issued_at")) is None:
+        return {"valid": False, "failed_rule": "issued_at_unparseable"}
+
+    exp = _parse_iso(cred.get("expires_at"))
+    if "expires_at" in cred and (exp is None or exp <= datetime.now(timezone.utc)):
         return {"valid": False, "failed_rule": "expired_or_unparseable"}
 
     if not _is_hex_signature(cred.get("signature")):
@@ -117,28 +107,17 @@ def _deterministic_check(cred: dict) -> dict:
     return {"valid": True, "failed_rule": ""}
 
 
-# ---------------------------------------------------------------------------
-# Equivalence check
-# ---------------------------------------------------------------------------
-
-
-def _semantic_summary(cred: dict) -> str:
-    """Render the credential for the consistency judgement."""
-    return json.dumps({k: v for k, v in cred.items() if k != "signature"}, indent=2)
-
-
 def _judge_consistency(cred: dict):
-    """Semantic consistency check under equivalence consensus. Bounded to the
-    submitted document — never fetches, never invents outside facts."""
-    summary = _semantic_summary(cred)
+    """Semantic consistency under equivalence consensus; bounded to the
+    document, no network."""
+    summary = json.dumps({k: v for k, v in cred.items() if k != "signature"}, indent=2)
 
     def get_judgement() -> dict:
         prompt = (
-            "Judge whether this credential's own fields are internally "
-            "consistent — do the subject, issuer, and role/degree fields "
-            "cohere with no internal contradiction. Judge the document alone; "
-            "use no outside knowledge.\n\n"
-            'Respond as JSON: {"consistency": "CONSISTENT"|"INCONSISTENT"}\n\n'
+            "Are this credential's own fields internally consistent (subject, "
+            "issuer, role/degree cohere, no contradiction)? Judge the document "
+            'alone, no outside knowledge. Respond as JSON: '
+            '{"consistency": "CONSISTENT"|"INCONSISTENT"}\n\n'
             "Credential:\n" + summary
         )
         res = gl.nondet.exec_prompt(prompt, response_format="json")
@@ -148,46 +127,58 @@ def _judge_consistency(cred: dict):
         return {"consistency": verdict}
 
     principle = (
-        "The judgement must agree on whether the credential's fields are "
-        "internally consistent. Validators must independently assess the "
-        "document and reach the same conclusion, judging the document alone "
-        "with no outside knowledge."
+        "Validators must independently judge whether the fields are internally "
+        "consistent, from the document alone, and reach the same conclusion."
     )
     return gl.eq_principle.prompt_comparative(get_judgement, principle)
 
 
-def _normalize_judgement(raw) -> str:
-    """Coerce to allowed vocabulary; never trust the reply verbatim."""
-    if not isinstance(raw, str):
-        return "INCONCLUSIVE"
-    upper = raw.strip().upper()
-    if "INCONSISTENT" in upper:
-        return "INCONSISTENT"
-    if "CONSISTENT" in upper:
-        return "CONSISTENT"
-    return "INCONCLUSIVE"
-
-
-# ---------------------------------------------------------------------------
-# The contract
-# ---------------------------------------------------------------------------
-
-
 class CredentialAttest(gl.Contract):
     credentials: TreeMap[str, Credential]
+    issuers: TreeMap[str, Issuer]
+    commitments: TreeMap[str, str]
     cred_count: u256 = u256(0)
 
     def __init__(self):
         self.cred_count = u256(0)
 
-    def _now(self) -> int:
-        return int(datetime.now(timezone.utc).timestamp())
+    def _addr_key(self, addr) -> str:
+        if hasattr(addr, "as_hex"):
+            return addr.as_hex.lower()
+        return str(addr).lower()
+
+    @gl.public.write.payable
+    def register_issuer(self) -> None:
+        """Register the caller as an issuer, locking a stake."""
+        sender = self._addr_key(gl.message.sender_address)
+        if sender in self.issuers:
+            raise gl.vm.UserError("Issuer already registered")
+        value = gl.message.value
+        if value < ISSUER_STAKE:
+            raise gl.vm.UserError("Stake below required minimum")
+        self.issuers[sender] = Issuer(address=sender, stake=u256(value), active=True)
+
+    @gl.public.view
+    def is_registered_issuer(self, address: str) -> bool:
+        return self._addr_key(address) in self.issuers
+
+    @gl.public.write
+    def register_commitment(self, credential_json: str) -> None:
+        """Register a keccak256 commitment to canonical content (issuer only)."""
+        sender = self._addr_key(gl.message.sender_address)
+        if sender not in self.issuers:
+            raise gl.vm.UserError("Caller is not a registered issuer")
+        try:
+            cred = json.loads(credential_json)
+        except Exception:
+            raise gl.vm.UserError("Credential is not valid JSON")
+        commitment = _content_commitment(cred)
+        self.commitments[sender + "|" + commitment] = "1"
 
     @gl.public.write
     def attest_credential(self, credential_json: str) -> str:
-        """Attest a credential. The deterministic structural check runs first;
-        a credential failing it is rejected before any semantic round, so the
-        LLM never judges a malformed document."""
+        """Attest a credential: structural gate, issuer commitment, then
+        semantic consistency round."""
         try:
             cred = json.loads(credential_json)
         except Exception:
@@ -199,59 +190,57 @@ class CredentialAttest(gl.Contract):
                 "Credential failed structural validation: " + structural["failed_rule"]
             )
 
+        cred_type = cred.get("type", "")
+        issuer_field = {"employment": "issuer", "education": "institution",
+                        "certification": "authority", "identity": "issuer"}[cred_type]
+        issuer_addr = cred.get(issuer_field, "")
+        issuer_key = self._addr_key(issuer_addr)
+        if issuer_key not in self.issuers:
+            raise gl.vm.UserError("Issuer is not registered")
+
+        commitment = _content_commitment(cred)
+        if self.commitments.get(issuer_key + "|" + commitment, None) is None:
+            raise gl.vm.UserError("Issuer has not registered a commitment to this content")
+
         try:
             judgement = _judge_consistency(cred)
-            consistency = _normalize_judgement(judgement.get("consistency", ""))
+            consistency = judgement.get("consistency", "INCONCLUSIVE")
         except gl.vm.UserError:
             consistency = "INCONCLUSIVE"
-
-        cred_type = cred.get("type", "")
-        subject = cred.get("subject", "")
-        issuer = cred.get("issuer", "")
-
-        is_valid = structural["valid"] and consistency == "CONSISTENT"
-        failed_rule = structural["failed_rule"]
-        if is_valid is False and not failed_rule:
-            failed_rule = "inconsistent_fields"
 
         cred_id = str(int(self.cred_count))
         self.cred_count += u256(1)
 
+        is_valid = consistency == "CONSISTENT"
+        failed_rule = ""
+        if consistency == "INCONSISTENT":
+            failed_rule = "inconsistent_fields"
+        elif consistency == "INCONCLUSIVE":
+            failed_rule = "consistency_indeterminate"
+
         self.credentials[cred_id] = Credential(
             cred_id=cred_id,
-            cred_type=cred_type,
-            subject=subject,
-            issuer=issuer,
+            cred_type=cred.get("type", ""),
+            subject=cred.get("subject", ""),
+            issuer=issuer_addr,
+            commitment=commitment,
             is_valid=bool(is_valid),
             failed_rule=failed_rule,
             consistency=consistency,
             attester=str(gl.message.sender_address),
-            created_at=u256(self._now()),
-            verify_count=u256(0),
-            last_verify_result="",
         )
         return cred_id
 
     @gl.public.view
     def get_credential(self, cred_id: str) -> dict:
-        """Read a stored credential attestation."""
-        cred_id = str(cred_id)
-        c = self.credentials.get(cred_id, None)
+        c = self.credentials.get(str(cred_id), None)
         if c is None:
             return {"exists": False}
         return {
-            "exists": True,
-            "cred_id": c.cred_id,
-            "cred_type": c.cred_type,
-            "subject": c.subject,
-            "issuer": c.issuer,
-            "is_valid": c.is_valid,
-            "failed_rule": c.failed_rule,
-            "consistency": c.consistency,
-            "attester": c.attester,
-            "created_at": c.created_at,
-            "verify_count": c.verify_count,
-            "last_verify_result": c.last_verify_result,
+            "exists": True, "cred_id": c.cred_id, "cred_type": c.cred_type,
+            "subject": c.subject, "issuer": c.issuer, "commitment": c.commitment,
+            "is_valid": c.is_valid, "failed_rule": c.failed_rule,
+            "consistency": c.consistency, "attester": c.attester,
         }
 
     @gl.public.view
