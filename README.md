@@ -44,6 +44,31 @@ Both records are readable on the explorer.
 
 The deterministic-gate-then-equivalence-check pattern is the shape any "validate a submitted document" primitive needs. The schema map is data, so extending to new credential types is a one-line change. The structural gate is the safety property that keeps an LLM from ever deciding an outcome on its own.
 
+## Tests
+
+23 direct-mode tests via `gltest`:
+
+```bash
+gltest tests/ -v
+```
+
+Coverage: each supported type validates against its own required fields, non-JSON rejection, unknown-type rejection, missing/empty field rejection, expired and unparseable expiry rejection, malformed and short signature rejection, LLM reply normalization (clean / lowercase / off-vocabulary / missing field), consistency-driven validity, ID incrementing, unknown-record handling, attester recording.
+
+The tests were bite-checked — each guard was verified to fail when its defect is reintroduced:
+
+| Defect injected | Tests that fail |
+|---|---|
+| Expiry check removed | 3 |
+| Signature check removed | 2 |
+| Required-field check removed | 3 |
+| LLM reply not normalized | 1 |
+| `is_valid` ignores consistency | 4 |
+| Unknown-type check removed | 1 |
+
+Rejection tests register an LLM mock and assert the specific structural rule (or that no stray `KeyError` fired), so they cannot pass on an unrelated error — the blind spot that makes a rejection test fake.
+
+Note: `gl.eq_principle.prompt_comparative`'s internal leader/validator round is proven live on Bradbury (MAJORITY_AGREE below); direct mode cannot simulate that primitive's round, so the tests pin the deterministic gate and the normalization invariant instead.
+
 ## Tech Stack
 
 - **Contract:** Python GenLayer Intelligent Contract (GenVM runner `1jb45aa8...`)
